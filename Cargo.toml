@@ -1,0 +1,30 @@
+[package]
+name = "mosdns-rs"
+version = "1.1.1"
+edition = "2021"
+
+[[bin]]
+name = "mosdns-rs"
+path = "src/main.rs"
+
+[dependencies]
+regex = "1"
+# DoQ（DNS over QUIC）上游：RFC 9250
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "net", "io-util"] }
+# DoH 需要 HTTP/2（与原版一致的 POST application/dns-message）
+h2 = "0.4"
+http = "1"
+bytes = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# DoH3（HTTP/3 上的 DoH）
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+panic = "abort"

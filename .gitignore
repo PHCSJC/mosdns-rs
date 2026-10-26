@@ -1,0 +1,16 @@
+# 构建产物
+/target/
+**/target/
+
+# 二进制（发版走 Release，不入库）
+mosdns-rs
+mosdns-rs-*
+!mosdns-rs-*.md
+
+# 数据文件（每个部署环境不同，体积大）
+Country.mmdb
+*.mmdb
+config.yaml
+*.log
+*.bin
+OPS.md
