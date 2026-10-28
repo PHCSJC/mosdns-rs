@@ -6,9 +6,10 @@
 //! - 单条查询耗时 >= 2000 ms
 //!
 //! 落盘目录默认是 `<日志文件所在目录>/mosdns-fail`，可用 `log.fail_dir` 覆盖。
-//! 自带三道闸：每分钟文件数上限、目录总大小上限、按天清理，避免故障时把盘写满。
+//! 自带四道闸：同名同类型查询每小时最多一条、每分钟文件数上限、目录总大小上限、按天清理，
+//! 避免"一个永远失败的域名 + 定时探测"把目录刷爆（实测过 2880 个文件/天）。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -20,9 +21,16 @@ struct State {
     keep_days: u64,
     max_total: u64,
     recent: VecDeque<Instant>,
+    /// 同名同类型查询的最近落盘时间（"qname|qtype" → 时刻）
+    seen: HashMap<String, Instant>,
     writes: u64,
     skipped: u64,
 }
+
+/// 同一个 (qname, qtype) 最多这么久落一次盘
+const SAME_QNAME_INTERVAL: Duration = Duration::from_secs(3600);
+/// seen 表的上限，超过就清理过期项；清理后仍满则本次不落盘
+const SEEN_MAX: usize = 8192;
 
 static ST: OnceLock<Mutex<State>> = OnceLock::new();
 
@@ -42,6 +50,7 @@ pub fn init(dir: PathBuf, per_min: usize, keep_days: u64, max_total_mb: u64) {
         keep_days,
         max_total,
         recent: VecDeque::new(),
+        seen: HashMap::new(),
         writes: 0,
         skipped: 0,
     }));
@@ -64,6 +73,16 @@ pub fn dump(stamp: &str, qname: &str, qtype: u16, header: &str, raw_hex: &str) -
     };
 
     let now = Instant::now();
+
+    // 闸 0：同名同类型查询每小时只留一条（定时探测死域名时最有效）
+    let key = format!("{}|{}", qname, qtype);
+    if let Some(t) = st.seen.get(&key) {
+        if now.duration_since(*t) < SAME_QNAME_INTERVAL {
+            st.skipped += 1;
+            return false;
+        }
+    }
+
     while let Some(t) = st.recent.front() {
         if now.duration_since(*t) > Duration::from_secs(60) {
             st.recent.pop_front();
@@ -96,6 +115,17 @@ pub fn dump(stamp: &str, qname: &str, qtype: u16, header: &str, raw_hex: &str) -
         body.push('\n');
     }
     let ok = fs::write(&path, body.as_bytes()).is_ok();
+
+    // 记录本次落盘时刻；表满时先清理过期项
+    if st.seen.len() >= SEEN_MAX {
+        let cutoff = now.checked_sub(SAME_QNAME_INTERVAL).unwrap_or(now);
+        st.seen.retain(|_, t| *t > cutoff);
+        if st.seen.len() >= SEEN_MAX {
+            st.seen.clear();
+        }
+    }
+    st.seen.insert(key, now);
+
     st.writes += 1;
 
     // 每 200 个文件做一次清理
