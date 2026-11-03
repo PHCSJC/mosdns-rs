@@ -234,7 +234,15 @@ impl RExec for Cache {
             ctx.set_resp(m);
             hit = true;
             if lazy {
-                self.spawn_lazy_update(key.clone(), ctx.copy_ctx(), next.clone());
+                // ★ 关键：后台刷新的上下文不能带这次的旧响应。
+                //   否则链路里第一个 `has_resp -> accept` 会直接短路，
+                //   变成"假刷新"（不查上游，还把旧响应重新存回去 → 条目永远卡在 TTL=5）。
+                //   对齐上游 mosdns：它在 SetResponse 之前就 qCtx.Copy()，副本里 R() 为 nil。
+                let mut refresh_ctx = ctx.copy_ctx();
+                refresh_ctx.r = None;
+                refresh_ctx.resp_gen = 0;
+                refresh_ctx.attempts.clear();
+                self.spawn_lazy_update(key.clone(), refresh_ctx, next.clone());
             }
         }
 
@@ -271,9 +279,27 @@ impl Cache {
                 .first()
                 .map(|x| x.name.clone())
                 .unwrap_or_default();
+            if crate::log::enabled(crate::log::LV_DEBUG) {
+                crate::log::debug(format!("start lazy cache update for {}", qname));
+            }
+            let gen_before = ctx.resp_gen;
             let r = next.exec_next(&mut ctx);
             match (&r, &ctx.r) {
-                (Ok(()), Some(resp)) => this.save(&key, resp),
+                // 只有这次刷新真的产生了新响应才写回；否则不能动旧条目（否则会把寿命续上）
+                (Ok(()), Some(resp)) if ctx.resp_gen != gen_before => {
+                    this.save(&key, resp);
+                    if crate::log::enabled(crate::log::LV_DEBUG) {
+                        crate::log::debug(format!("lazy cache updated for {}", qname));
+                    }
+                }
+                (Ok(()), _) => {
+                    if crate::log::enabled(crate::log::LV_DEBUG) {
+                        crate::log::debug(format!(
+                            "lazy update produced no new response for {}, keep stale entry",
+                            qname
+                        ));
+                    }
+                }
                 (Err(e), _) => {
                     // 对齐 Go 版的 "failed to update lazy cache" 可观测性
                     if crate::log::enabled(crate::log::LV_DEBUG) {
